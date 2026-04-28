@@ -128,7 +128,16 @@ The project includes GitHub Actions workflows for:
 - static analysis and tests
 - release APK build artifact generation
 
-For public distribution, prefer GitHub Releases or Actions artifacts instead of committing APK binaries to git.
+To build an APK on GitHub:
+
+1. Open the repository on GitHub.
+2. Go to **Actions**.
+3. Select **Build APK**.
+4. Click **Run workflow**.
+5. Open the completed workflow run.
+6. Download the `vault-release-apk` artifact.
+
+For public distribution, prefer GitHub Releases or Actions artifacts instead of committing APK binaries to git. See [docs/RELEASING.md](docs/RELEASING.md) for release note and APK attachment steps.
 
 ## Project Status
 
