@@ -3,6 +3,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../backup/backup_errors.dart';
 import '../../backup/backup_io.dart';
+import '../../auth/session_manager.dart';
 import '../../crypto/secure_bytes.dart';
 import '../../crypto/vault_crypto.dart';
 import '../../security/root_detector.dart';
@@ -48,7 +49,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     setState(() => _exporting = true);
     try {
       final bytes = await ref.read(vaultStatusProvider.notifier).readRawBytes();
-      final result = await exportBackup(vaultBytes: bytes);
+      final result = await ref
+          .read(sessionManagerProvider)
+          .runExternalPicker(() => exportBackup(vaultBytes: bytes));
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -95,7 +98,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     );
     if (!mounted || confirmed != true) return;
 
-    final bytes = await pickBackupFile();
+    final bytes = await ref
+        .read(sessionManagerProvider)
+        .runExternalPicker(pickBackupFile);
     if (!mounted || bytes == null) return;
 
     final password = await _promptForBackupPassword();
@@ -103,15 +108,14 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
 
     setState(() => _importing = true);
     final pwBytes = passwordToUtf8Bytes(password);
+    var imported = false;
     try {
+      await _settleExternalRoute();
+      if (!mounted) return;
       await ref
           .read(vaultStatusProvider.notifier)
           .importBackup(masterPasswordUtf8: pwBytes, bytes: bytes);
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Backup restored.')));
-      Navigator.of(context).popUntil((route) => route.isFirst);
+      imported = true;
     } on FormatException catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(
@@ -131,39 +135,20 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     } finally {
       pwBytes.secureZero();
       if (mounted) setState(() => _importing = false);
+      if (mounted && imported) Navigator.of(context).pop();
     }
   }
 
-  Future<String?> _promptForBackupPassword() async {
-    final ctrl = TextEditingController();
-    final result = await showDialog<String>(
+  Future<void> _settleExternalRoute() async {
+    await Future<void>.delayed(Duration.zero);
+    await WidgetsBinding.instance.endOfFrame;
+  }
+
+  Future<String?> _promptForBackupPassword() {
+    return showDialog<String>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Backup master password'),
-        content: TextField(
-          controller: ctrl,
-          obscureText: true,
-          autofocus: true,
-          decoration: const InputDecoration(
-            labelText: 'Master password for the backup',
-            border: OutlineInputBorder(),
-          ),
-          onSubmitted: (v) => Navigator.of(ctx).pop(v),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(ctx).pop(ctrl.text),
-            child: const Text('Restore'),
-          ),
-        ],
-      ),
+      builder: (ctx) => _BackupPasswordDialog(),
     );
-    ctrl.dispose();
-    return result;
   }
 
   @override
@@ -257,6 +242,50 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           ],
         ),
       ),
+    );
+  }
+}
+
+class _BackupPasswordDialog extends StatefulWidget {
+  const _BackupPasswordDialog();
+
+  @override
+  State<_BackupPasswordDialog> createState() => _BackupPasswordDialogState();
+}
+
+class _BackupPasswordDialogState extends State<_BackupPasswordDialog> {
+  final _ctrl = TextEditingController();
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Backup master password'),
+      content: TextField(
+        controller: _ctrl,
+        obscureText: true,
+        autofocus: true,
+        decoration: const InputDecoration(
+          labelText: 'Master password for the backup',
+          border: OutlineInputBorder(),
+        ),
+        onSubmitted: (v) => Navigator.of(context).pop(v),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(_ctrl.text),
+          child: const Text('Restore'),
+        ),
+      ],
     );
   }
 }

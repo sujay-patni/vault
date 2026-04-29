@@ -1,9 +1,14 @@
 import 'dart:async';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:share_plus/share_plus.dart';
 
+import '../../auth/session_manager.dart';
+import '../../vault/vault_attachment.dart';
 import '../../vault/vault_entry.dart';
 import '../../vault/vault_repository.dart';
 import '../../vault/vault_state.dart';
@@ -25,6 +30,7 @@ class _EntryDetailScreenState extends ConsumerState<EntryDetailScreen> {
   final _visibleFields = <String>{};
   Timer? _clipboardClearTimer;
   String? _lastCopiedToken;
+  bool _attachmentBusy = false;
 
   @override
   void dispose() {
@@ -105,12 +111,292 @@ class _EntryDetailScreenState extends ConsumerState<EntryDetailScreen> {
     await ref.read(vaultStatusProvider.notifier).saveEntries(next);
   }
 
+  int _vaultAttachmentBytesExcluding(VaultUnlocked current, String entryId) {
+    return current.entries
+        .where((entry) => entry.id != entryId)
+        .fold<int>(
+          0,
+          (sum, entry) =>
+              sum +
+              entry.attachments.fold<int>(
+                0,
+                (entrySum, attachment) => entrySum + attachment.sizeBytes,
+              ),
+        );
+  }
+
+  Future<void> _addAttachment(VaultEntry entry) async {
+    if (_attachmentBusy) return;
+    final source = await showModalBottomSheet<_AttachmentSource>(
+      context: context,
+      showDragHandle: true,
+      builder: (_) => const _AttachmentSourceSheet(),
+    );
+    if (!mounted || source == null) return;
+    switch (source) {
+      case _AttachmentSource.files:
+        await _addFileAttachments(entry);
+      case _AttachmentSource.camera:
+        await _capturePhotoAttachment(entry);
+    }
+  }
+
+  Future<void> _addFileAttachments(VaultEntry entry) async {
+    final cur = ref.read(vaultStatusProvider);
+    if (cur is! VaultUnlocked) return;
+    final result = await ref
+        .read(sessionManagerProvider)
+        .runExternalPicker(
+          () => FilePicker.platform.pickFiles(
+            dialogTitle: 'Add attachments',
+            type: FileType.custom,
+            allowedExtensions: allowedAttachmentExtensions,
+            allowMultiple: true,
+            withData: true,
+          ),
+        );
+    if (!mounted || result == null) return;
+
+    var nextVaultBytes =
+        _vaultAttachmentBytesExcluding(cur, entry.id) +
+        entry.attachments.fold<int>(0, (sum, a) => sum + a.sizeBytes);
+    final accepted = <VaultAttachment>[];
+    final rejected = <String>[];
+    for (final file in result.files) {
+      final bytes = file.bytes;
+      if (!isAllowedAttachmentFileName(file.name)) {
+        rejected.add('${file.name}: unsupported type');
+        continue;
+      }
+      if (bytes == null) {
+        rejected.add('${file.name}: could not read file');
+        continue;
+      }
+      if (bytes.length > maxAttachmentBytes) {
+        rejected.add(
+          '${file.name}: over ${formatAttachmentSize(maxAttachmentBytes)}',
+        );
+        continue;
+      }
+      if (nextVaultBytes + bytes.length > maxVaultAttachmentBytes) {
+        rejected.add(
+          '${file.name}: vault attachment limit is '
+          '${formatAttachmentSize(maxVaultAttachmentBytes)}',
+        );
+        continue;
+      }
+      nextVaultBytes += bytes.length;
+      accepted.add(
+        VaultAttachment.fromBytes(
+          fileName: file.name,
+          bytes: Uint8List.fromList(bytes),
+        ),
+      );
+    }
+    if (accepted.isEmpty) {
+      if (rejected.isNotEmpty && mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(rejected.first)));
+      }
+      return;
+    }
+    final now = DateTime.now();
+    final updated = entry.copyWith(
+      attachments: [...entry.attachments, ...accepted],
+      updatedAt: now,
+    );
+    final next = cur.entries
+        .map((candidate) => candidate.id == entry.id ? updated : candidate)
+        .toList(growable: false);
+    await ref.read(vaultStatusProvider.notifier).saveEntries(next);
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            rejected.isEmpty
+                ? 'Attachment added.'
+                : 'Added ${accepted.length}; skipped ${rejected.length}: '
+                      '${rejected.first}',
+          ),
+        ),
+      );
+    }
+  }
+
+  Future<void> _capturePhotoAttachment(VaultEntry entry) async {
+    final cur = ref.read(vaultStatusProvider);
+    if (cur is! VaultUnlocked) return;
+    setState(() => _attachmentBusy = true);
+    try {
+      final photo = await ref
+          .read(sessionManagerProvider)
+          .runExternalPicker(
+            () => ImagePicker().pickImage(
+              source: ImageSource.camera,
+              maxWidth: 1280,
+              maxHeight: 1280,
+              imageQuality: 72,
+              requestFullMetadata: false,
+            ),
+          );
+      if (!mounted || photo == null) return;
+
+      final bytes = await photo.readAsBytes();
+      if (!mounted) return;
+      if (bytes.length > maxAttachmentBytes) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Photo is over ${formatAttachmentSize(maxAttachmentBytes)}.',
+            ),
+          ),
+        );
+        return;
+      }
+      final nextVaultBytes =
+          _vaultAttachmentBytesExcluding(cur, entry.id) +
+          entry.attachments.fold<int>(0, (sum, a) => sum + a.sizeBytes) +
+          bytes.length;
+      if (nextVaultBytes > maxVaultAttachmentBytes) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Vault attachment limit is '
+              '${formatAttachmentSize(maxVaultAttachmentBytes)}.',
+            ),
+          ),
+        );
+        return;
+      }
+
+      final updated = entry.copyWith(
+        attachments: [
+          ...entry.attachments,
+          VaultAttachment.fromBytes(
+            fileName: _photoFileName(),
+            bytes: Uint8List.fromList(bytes),
+            mimeType: 'image/jpeg',
+          ),
+        ],
+        updatedAt: DateTime.now(),
+      );
+      final next = cur.entries
+          .map((candidate) => candidate.id == entry.id ? updated : candidate)
+          .toList(growable: false);
+      await ref.read(vaultStatusProvider.notifier).saveEntries(next);
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Photo attached.')));
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Photo capture failed: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _attachmentBusy = false);
+    }
+  }
+
+  Future<void> _deleteAttachment(
+    VaultEntry entry,
+    VaultAttachment attachment,
+  ) async {
+    final cur = ref.read(vaultStatusProvider);
+    if (cur is! VaultUnlocked) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Remove attachment?'),
+        content: Text('"${attachment.fileName}" will be removed.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(ctx).colorScheme.error,
+            ),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || ok != true) return;
+    final updated = entry.copyWith(
+      attachments: entry.attachments
+          .where((item) => item.id != attachment.id)
+          .toList(growable: false),
+      updatedAt: DateTime.now(),
+    );
+    final next = cur.entries
+        .map((candidate) => candidate.id == entry.id ? updated : candidate)
+        .toList(growable: false);
+    await ref.read(vaultStatusProvider.notifier).saveEntries(next);
+  }
+
+  Future<void> _exportAttachment(VaultAttachment attachment) async {
+    final path = await ref
+        .read(sessionManagerProvider)
+        .runExternalPicker(
+          () => FilePicker.platform.saveFile(
+            dialogTitle: 'Export attachment',
+            fileName: attachment.fileName,
+            bytes: attachment.decodeBytes(),
+          ),
+        );
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(path == null ? 'Export cancelled.' : 'Attachment saved.'),
+      ),
+    );
+  }
+
+  Future<void> _shareAttachment(VaultAttachment attachment) async {
+    await ref
+        .read(sessionManagerProvider)
+        .runExternalPicker(
+          () => SharePlus.instance.share(
+            ShareParams(
+              title: attachment.fileName,
+              files: [
+                XFile.fromData(
+                  attachment.decodeBytes(),
+                  name: attachment.fileName,
+                  mimeType: attachment.mimeType,
+                ),
+              ],
+              fileNameOverrides: [attachment.fileName],
+            ),
+          ),
+        );
+  }
+
   @override
   Widget build(BuildContext context) {
     final status = ref.watch(vaultStatusProvider);
+    if (status is! VaultUnlocked) {
+      return _UnavailableEntryScreen(
+        title: 'Vault locked',
+        message: 'Unlock the vault to view this item again.',
+        buttonLabel: 'Back to unlock',
+        onBack: () => Navigator.of(context).popUntil((route) => route.isFirst),
+      );
+    }
     final entry = _findEntry(status);
     if (entry == null) {
-      return const Scaffold(body: Center(child: Text('Item not found.')));
+      return _UnavailableEntryScreen(
+        title: 'Item not found',
+        message: 'This item is no longer available in the unlocked vault.',
+        buttonLabel: 'Back to vault',
+        onBack: () => Navigator.of(context).popUntil((route) => route.isFirst),
+      );
     }
     final fields = _displayFieldsFor(entry);
     return Scaffold(
@@ -169,6 +455,15 @@ class _EntryDetailScreenState extends ConsumerState<EntryDetailScreen> {
                     : null,
               ),
             if (entry.tags.isNotEmpty) _TagsField(tags: entry.tags),
+            const SizedBox(height: VaultSpacing.md),
+            _AttachmentsSection(
+              attachments: entry.attachments,
+              busy: _attachmentBusy,
+              onAdd: () => _addAttachment(entry),
+              onExport: _exportAttachment,
+              onShare: _shareAttachment,
+              onDelete: (attachment) => _deleteAttachment(entry, attachment),
+            ),
           ],
         ),
       ),
@@ -335,6 +630,40 @@ class _TypeHeader extends StatelessWidget {
   }
 }
 
+class _UnavailableEntryScreen extends StatelessWidget {
+  const _UnavailableEntryScreen({
+    required this.title,
+    required this.message,
+    required this.buttonLabel,
+    required this.onBack,
+  });
+
+  final String title;
+  final String message;
+  final String buttonLabel;
+  final VoidCallback onBack;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text(title)),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(VaultSpacing.lg),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(message, textAlign: TextAlign.center),
+              const SizedBox(height: VaultSpacing.md),
+              FilledButton(onPressed: onBack, child: Text(buttonLabel)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _TagsField extends StatelessWidget {
   const _TagsField({required this.tags});
 
@@ -416,4 +745,221 @@ class _Field extends StatelessWidget {
       ),
     );
   }
+}
+
+class _AttachmentsSection extends StatelessWidget {
+  const _AttachmentsSection({
+    required this.attachments,
+    required this.busy,
+    required this.onAdd,
+    required this.onExport,
+    required this.onShare,
+    required this.onDelete,
+  });
+
+  final List<VaultAttachment> attachments;
+  final bool busy;
+  final VoidCallback onAdd;
+  final ValueChanged<VaultAttachment> onExport;
+  final ValueChanged<VaultAttachment> onShare;
+  final ValueChanged<VaultAttachment> onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      decoration: BoxDecoration(
+        color: VaultColors.surface,
+        borderRadius: BorderRadius.circular(VaultRadii.md),
+        border: Border.all(color: VaultColors.border),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(VaultSpacing.md),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.attach_file_outlined, size: 20),
+                const SizedBox(width: VaultSpacing.sm),
+                Expanded(
+                  child: Text('Attachments', style: theme.textTheme.titleSmall),
+                ),
+                TextButton.icon(
+                  onPressed: busy ? null : onAdd,
+                  icon: busy
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.add),
+                  label: Text(busy ? 'Processing' : 'Add'),
+                ),
+              ],
+            ),
+            if (attachments.isEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: VaultSpacing.xs),
+                child: Text(
+                  'No attachments.',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: VaultColors.textMuted,
+                  ),
+                ),
+              )
+            else
+              for (final attachment in attachments)
+                _AttachmentTile(
+                  attachment: attachment,
+                  busy: busy,
+                  onExport: () => onExport(attachment),
+                  onShare: () => onShare(attachment),
+                  onDelete: () => onDelete(attachment),
+                ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _AttachmentTile extends StatelessWidget {
+  const _AttachmentTile({
+    required this.attachment,
+    required this.busy,
+    required this.onExport,
+    required this.onShare,
+    required this.onDelete,
+  });
+
+  final VaultAttachment attachment;
+  final bool busy;
+  final VoidCallback onExport;
+  final VoidCallback onShare;
+  final VoidCallback onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(top: VaultSpacing.sm),
+      padding: const EdgeInsets.all(VaultSpacing.sm),
+      decoration: BoxDecoration(
+        color: VaultColors.surfaceHigh,
+        borderRadius: BorderRadius.circular(VaultRadii.sm),
+        border: Border.all(color: VaultColors.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (attachment.isImage) ...[
+            ClipRRect(
+              borderRadius: BorderRadius.circular(VaultRadii.sm),
+              child: Image.memory(
+                attachment.decodeBytes(),
+                height: 180,
+                fit: BoxFit.cover,
+                errorBuilder: (_, _, _) => const SizedBox.shrink(),
+              ),
+            ),
+            const SizedBox(height: VaultSpacing.sm),
+          ],
+          Row(
+            children: [
+              Icon(
+                attachment.isImage
+                    ? Icons.image_outlined
+                    : Icons.description_outlined,
+              ),
+              const SizedBox(width: VaultSpacing.sm),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      attachment.fileName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    Text(
+                      '${attachment.mimeType} • '
+                      '${formatAttachmentSize(attachment.sizeBytes)}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: VaultColors.textMuted,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              IconButton(
+                tooltip: 'Download unencrypted copy',
+                icon: const Icon(Icons.file_download_outlined),
+                onPressed: busy ? null : onExport,
+              ),
+              IconButton(
+                tooltip: 'Share unencrypted copy',
+                icon: const Icon(Icons.ios_share_outlined),
+                onPressed: busy ? null : onShare,
+              ),
+              IconButton(
+                tooltip: 'Remove attachment',
+                icon: const Icon(Icons.delete_outline),
+                onPressed: busy ? null : onDelete,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+enum _AttachmentSource { files, camera }
+
+class _AttachmentSourceSheet extends StatelessWidget {
+  const _AttachmentSourceSheet();
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: ListView(
+        shrinkWrap: true,
+        padding: const EdgeInsets.fromLTRB(
+          VaultSpacing.md,
+          VaultSpacing.sm,
+          VaultSpacing.md,
+          VaultSpacing.lg,
+        ),
+        children: [
+          ListTile(
+            leading: const Icon(Icons.upload_file_outlined),
+            title: const Text('Choose files'),
+            subtitle: const Text('Images and documents'),
+            onTap: () => Navigator.of(context).pop(_AttachmentSource.files),
+          ),
+          ListTile(
+            leading: const Icon(Icons.photo_camera_outlined),
+            title: const Text('Take photo'),
+            subtitle: const Text('Capture with camera'),
+            onTap: () => Navigator.of(context).pop(_AttachmentSource.camera),
+          ),
+          const Divider(),
+          ListTile(
+            leading: const Icon(Icons.close),
+            title: const Text('Cancel'),
+            onTap: () => Navigator.of(context).pop(),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+String _photoFileName() {
+  final now = DateTime.now();
+  String two(int v) => v.toString().padLeft(2, '0');
+  return 'photo-${now.year}${two(now.month)}${two(now.day)}-'
+      '${two(now.hour)}${two(now.minute)}${two(now.second)}.jpg';
 }

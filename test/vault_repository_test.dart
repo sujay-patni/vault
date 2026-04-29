@@ -1,8 +1,10 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pwm/crypto/argon2.dart';
 import 'package:pwm/crypto/vault_crypto.dart';
+import 'package:pwm/vault/vault_attachment.dart';
 import 'package:pwm/vault/vault_entry.dart';
 import 'package:pwm/vault/vault_repository.dart';
 
@@ -26,6 +28,16 @@ VaultEntry _entry({String title = 'gmail', String password = 's3cr3t'}) {
     favorite: true,
     createdAt: now,
     updatedAt: now,
+  );
+}
+
+VaultAttachment _attachment({
+  String fileName = 'id.png',
+  List<int> bytes = const [0, 1, 2, 3, 254, 255],
+}) {
+  return VaultAttachment.fromBytes(
+    fileName: fileName,
+    bytes: Uint8List.fromList(bytes),
   );
 }
 
@@ -74,6 +86,28 @@ void main() {
     expect(reopened.entries.map((e) => e.id), containsAll([e1.id, e2.id]));
   });
 
+  test('saveEntries persists attachment bytes across unlock', () async {
+    final pw = passwordToUtf8Bytes('pw');
+    var u = await repo.create(masterPasswordUtf8: pw, params: _fastParams);
+    final attachment = _attachment(bytes: [0, 10, 20, 30, 255]);
+    final entry = _entry(title: 'passport').copyWith(attachments: [attachment]);
+    u = await repo.saveEntries(current: u, entries: [entry]);
+    expect(u.entries.single.attachments.single.decodeBytes(), [
+      0,
+      10,
+      20,
+      30,
+      255,
+    ]);
+
+    final repo2 = VaultRepository(vaultFile: File('${tmp.path}/vault.bin'));
+    final reopened = await repo2.unlock(masterPasswordUtf8: pw);
+    final reopenedAttachment = reopened.entries.single.attachments.single;
+    expect(reopenedAttachment.fileName, 'id.png');
+    expect(reopenedAttachment.mimeType, 'image/png');
+    expect(reopenedAttachment.decodeBytes(), [0, 10, 20, 30, 255]);
+  });
+
   test('changePassword: new password unlocks, old does not', () async {
     final oldPw = passwordToUtf8Bytes('old-pw');
     final newPw = passwordToUtf8Bytes('new-pw');
@@ -97,6 +131,44 @@ void main() {
     );
   });
 
+  test('attachments survive password rotation and backup import', () async {
+    final oldPw = passwordToUtf8Bytes('old-pw');
+    final newPw = passwordToUtf8Bytes('new-pw');
+    var u = await repo.create(masterPasswordUtf8: oldPw, params: _fastParams);
+    final entry = _entry(title: 'tax docs').copyWith(
+      attachments: [
+        _attachment(fileName: 'return.pdf', bytes: [9, 8, 7, 6]),
+      ],
+    );
+    u = await repo.saveEntries(current: u, entries: [entry]);
+
+    await repo.changePassword(
+      current: u,
+      newMasterPasswordUtf8: newPw,
+      params: _fastParams,
+    );
+
+    final backupBytes = await repo.readRawBytes();
+    final importedFile = File('${tmp.path}/imported.bin');
+    final importedRepo = VaultRepository(vaultFile: importedFile);
+    final imported = await importedRepo.importBackup(
+      masterPasswordUtf8: newPw,
+      bytes: backupBytes,
+    );
+
+    expect(imported.entries.single.attachments.single.fileName, 'return.pdf');
+    expect(imported.entries.single.attachments.single.decodeBytes(), [
+      9,
+      8,
+      7,
+      6,
+    ]);
+    expect(
+      () => importedRepo.unlock(masterPasswordUtf8: oldPw),
+      throwsA(isA<Object>()),
+    );
+  });
+
   test('wrong password on unlock throws', () async {
     final pw = passwordToUtf8Bytes('right');
     await repo.create(masterPasswordUtf8: pw, params: _fastParams);
@@ -116,6 +188,7 @@ void main() {
     expect(back.password, e.password);
     expect(back.tags, e.tags);
     expect(back.favorite, isTrue);
+    expect(back.attachments, isEmpty);
     expect(
       back.createdAt.millisecondsSinceEpoch,
       e.createdAt.millisecondsSinceEpoch,
@@ -141,6 +214,35 @@ void main() {
     expect(back.itemType, VaultItemType.password);
     expect(back.tags, isEmpty);
     expect(back.favorite, isFalse);
+    expect(back.attachments, isEmpty);
+  });
+
+  test('VaultEntry round-trips one attachment through JSON', () {
+    final e = _entry(title: 'attachment-json').copyWith(
+      attachments: [
+        _attachment(fileName: 'scan.jpg', bytes: [1, 3, 5]),
+      ],
+    );
+    final back = VaultEntry.fromJson(e.toJson());
+    expect(back.attachments.length, 1);
+    expect(back.attachments.single.fileName, 'scan.jpg');
+    expect(back.attachments.single.mimeType, 'image/jpeg');
+    expect(back.attachments.single.sizeBytes, 3);
+    expect(back.attachments.single.decodeBytes(), [1, 3, 5]);
+  });
+
+  test('VaultEntry round-trips multiple attachments through JSON', () {
+    final e = _entry(title: 'multi-attachment-json').copyWith(
+      attachments: [
+        _attachment(fileName: 'scan.png', bytes: [1, 2]),
+        _attachment(fileName: 'note.txt', bytes: [3, 4, 5]),
+      ],
+    );
+    final back = VaultEntry.fromJson(e.toJson());
+    expect(back.attachments.map((a) => a.fileName), ['scan.png', 'note.txt']);
+    expect(back.attachments[0].decodeBytes(), [1, 2]);
+    expect(back.attachments[1].mimeType, 'text/plain');
+    expect(back.attachments[1].decodeBytes(), [3, 4, 5]);
   });
 
   test('VaultEntry round-trips typed secure note fields', () {

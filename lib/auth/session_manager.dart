@@ -18,6 +18,7 @@ class SessionManager with WidgetsBindingObserver {
   final Reader _read;
   final Duration _idleTimeout;
   Timer? _idleTimer;
+  int _externalPickerDepth = 0;
 
   void start() {
     WidgetsBinding.instance.addObserver(this);
@@ -33,6 +34,22 @@ class SessionManager with WidgetsBindingObserver {
   /// Call this on user activity (pointer events) to extend the idle window.
   void bumpActivity() {
     _resetIdleTimer();
+  }
+
+  /// Temporarily keep the vault unlocked while Android hands control to a
+  /// trusted system picker/camera intent. Normal backgrounding still locks.
+  Future<T> runExternalPicker<T>(Future<T> Function() action) async {
+    _externalPickerDepth += 1;
+    _idleTimer?.cancel();
+    try {
+      return await action();
+    } finally {
+      _externalPickerDepth -= 1;
+      if (_externalPickerDepth <= 0) {
+        _externalPickerDepth = 0;
+        _resetIdleTimer();
+      }
+    }
   }
 
   void _resetIdleTimer() {
@@ -54,7 +71,9 @@ class SessionManager with WidgetsBindingObserver {
       case AppLifecycleState.hidden:
       case AppLifecycleState.detached:
         _idleTimer?.cancel();
-        _lockIfUnlocked();
+        if (_externalPickerDepth == 0) {
+          _lockIfUnlocked();
+        }
         break;
       case AppLifecycleState.resumed:
         _resetIdleTimer();

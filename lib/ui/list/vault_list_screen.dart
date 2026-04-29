@@ -43,7 +43,14 @@ class _VaultListScreenState extends ConsumerState<VaultListScreen> {
               e.url.toLowerCase().contains(q) ||
               e.notes.toLowerCase().contains(q) ||
               e.tags.any((tag) => tag.toLowerCase().contains(q)) ||
-              e.fields.values.any((v) => v.toLowerCase().contains(q)),
+              _typeSearchTerms(e.itemType).any((term) => term.contains(q)) ||
+              e.fields.values.any((v) => v.toLowerCase().contains(q)) ||
+              e.attachments.any(
+                (attachment) =>
+                    attachment.fileName.toLowerCase().contains(q) ||
+                    (attachment.description?.toLowerCase().contains(q) ??
+                        false),
+              ),
         )
         .toList(growable: false);
   }
@@ -385,7 +392,24 @@ String? _metadataFor(VaultEntry entry) {
   for (final value in candidates) {
     if (value != null && value.trim().isNotEmpty) return value.trim();
   }
+  if (entry.attachments.isNotEmpty) {
+    return '${entry.attachments.length} attachment'
+        '${entry.attachments.length == 1 ? '' : 's'}';
+  }
   return entry.itemType.label;
+}
+
+List<String> _typeSearchTerms(VaultItemType type) {
+  return switch (type) {
+    VaultItemType.password => ['password', 'passwords', 'login', 'credential'],
+    VaultItemType.secureNote => ['note', 'notes', 'secure note'],
+    VaultItemType.paymentCard => ['card', 'cards', 'payment', 'credit card'],
+    VaultItemType.identity => ['id', 'ids', 'identity', 'document'],
+    VaultItemType.recoveryCodes => ['code', 'codes', 'recovery code'],
+    VaultItemType.apiKey => ['key', 'keys', 'api key', 'token'],
+    VaultItemType.wifi => ['wifi', 'wi-fi', 'network'],
+    VaultItemType.finance => ['finance', 'bank', 'banking', 'account'],
+  };
 }
 
 class _TagPill extends StatelessWidget {
