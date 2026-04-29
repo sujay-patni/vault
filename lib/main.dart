@@ -43,9 +43,18 @@ class _Root extends ConsumerWidget {
         final status = ref.watch(vaultStatusProvider);
         return IdleActivityDetector(
           child: switch (status) {
-            VaultUninitialized() => const SetupScreen(),
-            VaultLocked() => const UnlockScreen(),
-            VaultUnlocked() => const VaultListScreen(),
+            VaultUninitialized() => const KeyedSubtree(
+              key: ValueKey('vault-uninitialized'),
+              child: SetupScreen(),
+            ),
+            VaultLocked() => const KeyedSubtree(
+              key: ValueKey('vault-locked'),
+              child: UnlockScreen(),
+            ),
+            VaultUnlocked() => const KeyedSubtree(
+              key: ValueKey('vault-unlocked'),
+              child: VaultListScreen(),
+            ),
           },
         );
       },

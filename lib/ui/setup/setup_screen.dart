@@ -3,6 +3,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../backup/backup_errors.dart';
 import '../../backup/backup_io.dart';
+import '../../auth/session_manager.dart';
 import '../../crypto/secure_bytes.dart';
 import '../../crypto/vault_crypto.dart';
 import '../../vault/vault_repository.dart';
@@ -60,7 +61,9 @@ class _SetupScreenState extends ConsumerState<SetupScreen> {
 
   Future<void> _import() async {
     setState(() => _error = null);
-    final bytes = await pickBackupFile();
+    final bytes = await ref
+        .read(sessionManagerProvider)
+        .runExternalPicker(pickBackupFile);
     if (!mounted || bytes == null) return;
 
     final pw = await _promptForPassword();
@@ -68,10 +71,14 @@ class _SetupScreenState extends ConsumerState<SetupScreen> {
 
     setState(() => _busy = true);
     final pwBytes = passwordToUtf8Bytes(pw);
+    var imported = false;
     try {
+      await _settleExternalRoute();
+      if (!mounted) return;
       await ref
           .read(vaultStatusProvider.notifier)
           .importBackup(masterPasswordUtf8: pwBytes, bytes: bytes);
+      imported = true;
     } on FormatException catch (e) {
       if (mounted) {
         setState(() => _error = describeBackupFormatError(e));
@@ -85,40 +92,23 @@ class _SetupScreenState extends ConsumerState<SetupScreen> {
       }
     } finally {
       pwBytes.secureZero();
-      if (mounted) setState(() => _busy = false);
+      if (mounted && !imported) setState(() => _busy = false);
     }
   }
 
-  Future<String?> _promptForPassword() async {
-    final ctrl = TextEditingController();
-    final result = await showDialog<String>(
+  Future<void> _settleExternalRoute() async {
+    await Future<void>.delayed(Duration.zero);
+    await WidgetsBinding.instance.endOfFrame;
+  }
+
+  Future<String?> _promptForPassword() {
+    return showDialog<String>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Master password'),
-        content: TextField(
-          controller: ctrl,
-          obscureText: true,
-          autofocus: true,
-          decoration: const InputDecoration(
-            labelText: 'Master password for the backup',
-            border: OutlineInputBorder(),
-          ),
-          onSubmitted: (v) => Navigator.of(ctx).pop(v),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(ctx).pop(ctrl.text),
-            child: const Text('Restore'),
-          ),
-        ],
-      ),
+      builder: (ctx) {
+        final ctrl = TextEditingController();
+        return _PasswordDialog(ctrl: ctrl);
+      },
     );
-    ctrl.dispose();
-    return result;
   }
 
   Future<bool?> _showWarningDialog() {
@@ -221,6 +211,50 @@ class _SetupScreenState extends ConsumerState<SetupScreen> {
           ),
         ),
       ),
+    );
+  }
+}
+
+class _PasswordDialog extends StatefulWidget {
+  const _PasswordDialog({required this.ctrl});
+
+  final TextEditingController ctrl;
+
+  @override
+  State<_PasswordDialog> createState() => _PasswordDialogState();
+}
+
+class _PasswordDialogState extends State<_PasswordDialog> {
+  @override
+  void dispose() {
+    widget.ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Master password'),
+      content: TextField(
+        controller: widget.ctrl,
+        obscureText: true,
+        autofocus: true,
+        decoration: const InputDecoration(
+          labelText: 'Master password for the backup',
+          border: OutlineInputBorder(),
+        ),
+        onSubmitted: (v) => Navigator.of(context).pop(v),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(widget.ctrl.text),
+          child: const Text('Restore'),
+        ),
+      ],
     );
   }
 }
