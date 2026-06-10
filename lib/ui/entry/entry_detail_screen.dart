@@ -1,13 +1,14 @@
-import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:share_plus/share_plus.dart';
 
 import '../../auth/session_manager.dart';
+import '../../security/cache_janitor.dart';
+import '../../security/clipboard_guard.dart';
 import '../../vault/vault_attachment.dart';
 import '../../vault/vault_entry.dart';
 import '../../vault/vault_repository.dart';
@@ -15,8 +16,6 @@ import '../../vault/vault_state.dart';
 import '../shared/app_theme.dart';
 import '../shared/responsive.dart';
 import 'entry_form_screen.dart';
-
-const _clipboardClearAfter = Duration(seconds: 30);
 
 class EntryDetailScreen extends ConsumerStatefulWidget {
   const EntryDetailScreen({super.key, required this.entryId});
@@ -28,15 +27,7 @@ class EntryDetailScreen extends ConsumerStatefulWidget {
 
 class _EntryDetailScreenState extends ConsumerState<EntryDetailScreen> {
   final _visibleFields = <String>{};
-  Timer? _clipboardClearTimer;
-  String? _lastCopiedToken;
   bool _attachmentBusy = false;
-
-  @override
-  void dispose() {
-    _clipboardClearTimer?.cancel();
-    super.dispose();
-  }
 
   VaultEntry? _findEntry(VaultStatus s) {
     if (s is! VaultUnlocked) return null;
@@ -48,24 +39,19 @@ class _EntryDetailScreenState extends ConsumerState<EntryDetailScreen> {
 
   Future<void> _copy(String value, String fieldLabel) async {
     if (value.isEmpty) return;
-    final token = '${DateTime.now().microsecondsSinceEpoch}';
-    _lastCopiedToken = token;
-    await Clipboard.setData(ClipboardData(text: value));
+    await ref.read(clipboardGuardProvider).copySensitive(value);
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(
         SnackBar(
-          content: Text('$fieldLabel copied. Clears in 30s.'),
+          content: Text(
+            '$fieldLabel copied. Clears in '
+            '${clipboardClearAfter.inSeconds}s.',
+          ),
           duration: const Duration(seconds: 2),
         ),
       );
-    _clipboardClearTimer?.cancel();
-    _clipboardClearTimer = Timer(_clipboardClearAfter, () async {
-      if (_lastCopiedToken == token) {
-        await Clipboard.setData(const ClipboardData(text: ''));
-      }
-    });
   }
 
   Future<void> _delete(VaultEntry entry) async {
@@ -142,8 +128,7 @@ class _EntryDetailScreenState extends ConsumerState<EntryDetailScreen> {
   }
 
   Future<void> _addFileAttachments(VaultEntry entry) async {
-    final cur = ref.read(vaultStatusProvider);
-    if (cur is! VaultUnlocked) return;
+    if (ref.read(vaultStatusProvider) is! VaultUnlocked) return;
     final result = await ref
         .read(sessionManagerProvider)
         .runExternalPicker(
@@ -155,7 +140,12 @@ class _EntryDetailScreenState extends ConsumerState<EntryDetailScreen> {
             withData: true,
           ),
         );
+    // The picker caches plaintext copies of picked files; bytes are already
+    // in memory, so remove the copies before doing anything else.
+    await sweepSensitiveCaches();
     if (!mounted || result == null) return;
+    final cur = ref.read(vaultStatusProvider);
+    if (cur is! VaultUnlocked) return;
 
     var nextVaultBytes =
         _vaultAttachmentBytesExcluding(cur, entry.id) +
@@ -225,8 +215,7 @@ class _EntryDetailScreenState extends ConsumerState<EntryDetailScreen> {
   }
 
   Future<void> _capturePhotoAttachment(VaultEntry entry) async {
-    final cur = ref.read(vaultStatusProvider);
-    if (cur is! VaultUnlocked) return;
+    if (ref.read(vaultStatusProvider) is! VaultUnlocked) return;
     setState(() => _attachmentBusy = true);
     try {
       final photo = await ref
@@ -240,10 +229,19 @@ class _EntryDetailScreenState extends ConsumerState<EntryDetailScreen> {
               requestFullMetadata: false,
             ),
           );
-      if (!mounted || photo == null) return;
+      if (photo == null) {
+        await sweepSensitiveCaches();
+        return;
+      }
 
       final bytes = await photo.readAsBytes();
+      // The capture (and any scaled variant) lives unencrypted in the app
+      // cache until removed.
+      await deleteQuietly(photo.path);
+      await sweepSensitiveCaches();
       if (!mounted) return;
+      final cur = ref.read(vaultStatusProvider);
+      if (cur is! VaultUnlocked) return;
       if (bytes.length > maxAttachmentBytes) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -359,23 +357,29 @@ class _EntryDetailScreenState extends ConsumerState<EntryDetailScreen> {
   }
 
   Future<void> _shareAttachment(VaultAttachment attachment) async {
-    await ref
-        .read(sessionManagerProvider)
-        .runExternalPicker(
-          () => SharePlus.instance.share(
-            ShareParams(
-              title: attachment.fileName,
-              files: [
-                XFile.fromData(
-                  attachment.decodeBytes(),
-                  name: attachment.fileName,
-                  mimeType: attachment.mimeType,
-                ),
-              ],
-              fileNameOverrides: [attachment.fileName],
+    // Sharing inherently hands a plaintext copy to the receiving app; the
+    // staged copy share_plus writes to our cache is removed afterwards.
+    try {
+      await ref
+          .read(sessionManagerProvider)
+          .runExternalPicker(
+            () => SharePlus.instance.share(
+              ShareParams(
+                title: attachment.fileName,
+                files: [
+                  XFile.fromData(
+                    attachment.decodeBytes(),
+                    name: attachment.fileName,
+                    mimeType: attachment.mimeType,
+                  ),
+                ],
+                fileNameOverrides: [attachment.fileName],
+              ),
             ),
-          ),
-        );
+          );
+    } finally {
+      await sweepSensitiveCaches();
+    }
   }
 
   @override
@@ -824,7 +828,7 @@ class _AttachmentsSection extends StatelessWidget {
   }
 }
 
-class _AttachmentTile extends StatelessWidget {
+class _AttachmentTile extends StatefulWidget {
   const _AttachmentTile({
     required this.attachment,
     required this.busy,
@@ -840,7 +844,43 @@ class _AttachmentTile extends StatelessWidget {
   final VoidCallback onDelete;
 
   @override
+  State<_AttachmentTile> createState() => _AttachmentTileState();
+}
+
+class _AttachmentTileState extends State<_AttachmentTile> {
+  // Decoded once per attachment: a fresh Uint8List from decodeBytes() on
+  // every build would defeat Flutter's image cache and re-decode the image
+  // each rebuild.
+  Uint8List? _previewBytes;
+
+  @override
+  void initState() {
+    super.initState();
+    _decodePreview();
+  }
+
+  @override
+  void didUpdateWidget(covariant _AttachmentTile oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.attachment.id != widget.attachment.id) {
+      _decodePreview();
+    }
+  }
+
+  void _decodePreview() {
+    _previewBytes = widget.attachment.isImage
+        ? widget.attachment.decodeBytes()
+        : null;
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final attachment = widget.attachment;
+    final busy = widget.busy;
+    final onExport = widget.onExport;
+    final onShare = widget.onShare;
+    final onDelete = widget.onDelete;
+    final previewBytes = _previewBytes;
     return Container(
       margin: const EdgeInsets.only(top: VaultSpacing.sm),
       padding: const EdgeInsets.all(VaultSpacing.sm),
@@ -852,12 +892,13 @@ class _AttachmentTile extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          if (attachment.isImage) ...[
+          if (previewBytes != null) ...[
             ClipRRect(
               borderRadius: BorderRadius.circular(VaultRadii.sm),
               child: Image.memory(
-                attachment.decodeBytes(),
+                previewBytes,
                 height: 180,
+                cacheHeight: 360,
                 fit: BoxFit.cover,
                 errorBuilder: (_, _, _) => const SizedBox.shrink(),
               ),

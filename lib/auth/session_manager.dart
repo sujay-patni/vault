@@ -13,11 +13,15 @@ class SessionManager with WidgetsBindingObserver {
   SessionManager(
     this._read, {
     Duration idleTimeout = const Duration(seconds: 60),
-  }) : _idleTimeout = idleTimeout;
+    Duration pickerTimeout = const Duration(minutes: 10),
+  }) : _idleTimeout = idleTimeout,
+       _pickerTimeout = pickerTimeout;
 
   final Reader _read;
   final Duration _idleTimeout;
+  final Duration _pickerTimeout;
   Timer? _idleTimer;
+  Timer? _pickerFallbackTimer;
   int _externalPickerDepth = 0;
 
   void start() {
@@ -28,6 +32,8 @@ class SessionManager with WidgetsBindingObserver {
   void stop() {
     _idleTimer?.cancel();
     _idleTimer = null;
+    _pickerFallbackTimer?.cancel();
+    _pickerFallbackTimer = null;
     WidgetsBinding.instance.removeObserver(this);
   }
 
@@ -38,15 +44,21 @@ class SessionManager with WidgetsBindingObserver {
 
   /// Temporarily keep the vault unlocked while Android hands control to a
   /// trusted system picker/camera intent. Normal backgrounding still locks.
+  /// The exemption is bounded: if the picker has not returned within
+  /// [_pickerTimeout] (e.g. the user wandered off from the share sheet),
+  /// the vault locks anyway.
   Future<T> runExternalPicker<T>(Future<T> Function() action) async {
     _externalPickerDepth += 1;
     _idleTimer?.cancel();
+    _pickerFallbackTimer ??= Timer(_pickerTimeout, _lockIfUnlocked);
     try {
       return await action();
     } finally {
       _externalPickerDepth -= 1;
       if (_externalPickerDepth <= 0) {
         _externalPickerDepth = 0;
+        _pickerFallbackTimer?.cancel();
+        _pickerFallbackTimer = null;
         _resetIdleTimer();
       }
     }

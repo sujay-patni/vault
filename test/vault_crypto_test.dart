@@ -98,6 +98,59 @@ void main() {
     );
   });
 
+  group('unlockWithVaultKey', () {
+    test('decrypts the payload with the raw vault key', () async {
+      final pw = _bytes('bio-test');
+      final entries = _bytes(jsonEncode(['a', 'b']));
+      final blob = await crypto.create(
+        masterPasswordUtf8: pw,
+        entriesJsonBytes: entries,
+        params: _fastParams,
+      );
+      final unlocked = await crypto.unlock(masterPasswordUtf8: pw, blob: blob);
+
+      final viaKey = await crypto.unlockWithVaultKey(
+        vaultKey: unlocked.vaultKey,
+        blob: blob,
+      );
+      expect(viaKey, equals(entries));
+    });
+
+    test('wrong key fails GCM authentication', () async {
+      final blob = await crypto.create(
+        masterPasswordUtf8: _bytes('pw'),
+        entriesJsonBytes: _bytes('[]'),
+        params: _fastParams,
+      );
+      expect(
+        () => crypto.unlockWithVaultKey(vaultKey: Uint8List(32), blob: blob),
+        throwsA(isA<Object>()),
+      );
+    });
+
+    test('key from one vault rejects another vault\'s blob', () async {
+      final pw = _bytes('same-pw');
+      final blobA = await crypto.create(
+        masterPasswordUtf8: pw,
+        entriesJsonBytes: _bytes('["a"]'),
+        params: _fastParams,
+      );
+      final blobB = await crypto.create(
+        masterPasswordUtf8: pw,
+        entriesJsonBytes: _bytes('["b"]'),
+        params: _fastParams,
+      );
+      final unlockedA = await crypto.unlock(masterPasswordUtf8: pw, blob: blobA);
+      expect(
+        () => crypto.unlockWithVaultKey(
+          vaultKey: unlockedA.vaultKey,
+          blob: blobB,
+        ),
+        throwsA(isA<Object>()),
+      );
+    });
+  });
+
   group('changePassword', () {
     test(
       'new password unlocks; old password rejected; entries unchanged',

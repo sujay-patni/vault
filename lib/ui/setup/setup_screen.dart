@@ -3,6 +3,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../backup/backup_errors.dart';
 import '../../backup/backup_io.dart';
+import '../../auth/biometric_unlock.dart';
 import '../../auth/session_manager.dart';
 import '../../crypto/secure_bytes.dart';
 import '../../crypto/vault_crypto.dart';
@@ -48,10 +49,14 @@ class _SetupScreenState extends ConsumerState<SetupScreen> {
     setState(() => _busy = true);
     final pwBytes = passwordToUtf8Bytes(p1);
     try {
+      // The router swaps to the vault list the moment setup unlocks, so the
+      // "enable fingerprint?" offer is raised there via this one-shot flag.
+      ref.read(offerBiometricSetupProvider.notifier).state = true;
       await ref
           .read(vaultStatusProvider.notifier)
           .setupAndUnlock(masterPasswordUtf8: pwBytes);
     } catch (e) {
+      ref.read(offerBiometricSetupProvider.notifier).state = false;
       if (mounted) setState(() => _error = 'Setup failed: $e');
     } finally {
       pwBytes.secureZero();
@@ -79,6 +84,9 @@ class _SetupScreenState extends ConsumerState<SetupScreen> {
           .read(vaultStatusProvider.notifier)
           .importBackup(masterPasswordUtf8: pwBytes, bytes: bytes);
       imported = true;
+      // No vault existed before first-run import, so no biometric key should
+      // exist either — clear defensively in case of leftover state.
+      await ref.read(biometricUnlockServiceProvider).disable();
     } on FormatException catch (e) {
       if (mounted) {
         setState(() => _error = describeBackupFormatError(e));
@@ -166,6 +174,9 @@ class _SetupScreenState extends ConsumerState<SetupScreen> {
               TextField(
                 controller: _pw1,
                 obscureText: true,
+                autocorrect: false,
+                enableSuggestions: false,
+                enableIMEPersonalizedLearning: false,
                 autofocus: true,
                 enabled: !_busy,
                 decoration: const InputDecoration(
@@ -177,6 +188,9 @@ class _SetupScreenState extends ConsumerState<SetupScreen> {
               TextField(
                 controller: _pw2,
                 obscureText: true,
+                autocorrect: false,
+                enableSuggestions: false,
+                enableIMEPersonalizedLearning: false,
                 enabled: !_busy,
                 decoration: const InputDecoration(
                   labelText: 'Confirm master password',
@@ -238,6 +252,9 @@ class _PasswordDialogState extends State<_PasswordDialog> {
       content: TextField(
         controller: widget.ctrl,
         obscureText: true,
+        autocorrect: false,
+        enableSuggestions: false,
+        enableIMEPersonalizedLearning: false,
         autofocus: true,
         decoration: const InputDecoration(
           labelText: 'Master password for the backup',

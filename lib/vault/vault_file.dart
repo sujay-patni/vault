@@ -41,6 +41,16 @@ class VaultBlob {
   static const int wrappedKeyLen = 48; // 32 key + 16 tag
   static const int payloadIvLen = 12;
 
+  /// Sanity bounds on Argon2id parameters read from an untrusted file
+  /// (an imported backup). Without these, a corrupt or hostile header can
+  /// request terabytes of memory or absurd iteration counts before the
+  /// password is ever checked. Production defaults (65536 KiB / 3 / 4) sit
+  /// well inside.
+  static const int minArgonMemoryKib = 64;
+  static const int maxArgonMemoryKib = 2 * 1024 * 1024; // 2 GiB
+  static const int maxArgonIterations = 100;
+  static const int maxArgonParallelism = 16;
+
   /// Offset where the payload bytes begin (also the length of the AAD).
   static const int headerLen =
       4 +
@@ -134,6 +144,14 @@ class VaultBlob {
     off += 4;
     final parallelism = bytes[off];
     off += 1;
+    if (memKib < minArgonMemoryKib ||
+        memKib > maxArgonMemoryKib ||
+        iters < 1 ||
+        iters > maxArgonIterations ||
+        parallelism < 1 ||
+        parallelism > maxArgonParallelism) {
+      throw const FormatException('unreasonable Argon2 parameters in header');
+    }
     final wrapIv = Uint8List.sublistView(bytes, off, off + wrapIvLen);
     off += wrapIvLen;
     final wrappedKey = Uint8List.sublistView(bytes, off, off + wrappedKeyLen);

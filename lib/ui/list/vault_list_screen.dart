@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
+import '../../auth/biometric_store.dart';
+import '../../auth/biometric_unlock.dart';
 import '../../vault/vault_entry.dart';
 import '../../vault/vault_repository.dart';
 import '../../vault/vault_state.dart';
@@ -23,9 +25,56 @@ class _VaultListScreenState extends ConsumerState<VaultListScreen> {
   VaultItemType? _selectedType;
 
   @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _maybeOfferBiometric());
+  }
+
+  @override
   void dispose() {
     _searchCtrl.dispose();
     super.dispose();
+  }
+
+  /// Right after first-time setup, offer to enable fingerprint unlock.
+  /// Best-effort: any failure just leaves the Settings toggle available.
+  Future<void> _maybeOfferBiometric() async {
+    if (!mounted || !ref.read(offerBiometricSetupProvider)) return;
+    ref.read(offerBiometricSetupProvider.notifier).state = false;
+    final support = await ref.read(biometricSupportProvider.future);
+    if (!mounted || support != BiometricSupport.available) return;
+    final enable = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Enable fingerprint unlock?'),
+        content: const Text(
+          'You can unlock with your fingerprint instead of typing the master '
+          'password. The master password always works as a fallback.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Not now'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Enable'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || enable != true) return;
+    final ok = await ref.read(biometricUnlockServiceProvider).enable();
+    if (!ok && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Fingerprint setup cancelled — you can enable it later in '
+            'Settings.',
+          ),
+        ),
+      );
+    }
   }
 
   List<VaultEntry> _filter(List<VaultEntry> all) {

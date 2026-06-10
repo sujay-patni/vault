@@ -120,6 +120,26 @@ class VaultCrypto {
     }
   }
 
+  /// Decrypt the entries payload directly with [vaultKey], skipping Argon2id
+  /// and key unwrapping. Used by biometric unlock, where vault_key itself is
+  /// retrieved from hardware-backed storage instead of being unwrapped with
+  /// the master password.
+  ///
+  /// Throws on GCM authentication failure, which doubles as "this key does
+  /// not belong to this blob" (e.g. a stale key after a backup import).
+  /// The caller retains ownership of [vaultKey] and the returned buffer.
+  Future<Uint8List> unlockWithVaultKey({
+    required Uint8List vaultKey,
+    required VaultBlob blob,
+  }) {
+    return AesGcm256.instance.decrypt(
+      key: vaultKey,
+      nonce: blob.payloadIv,
+      ciphertextWithTag: blob.payload,
+      aad: blob.headerForAad(),
+    );
+  }
+
   /// Re-encrypt the payload with the given [vaultKey]. Produces a new blob
   /// reusing the existing salt/argon params/wrap (i.e. just persists updated
   /// entries — no password change involved).

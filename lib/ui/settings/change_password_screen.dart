@@ -100,6 +100,9 @@ class _ChangePasswordScreenState extends ConsumerState<ChangePasswordScreen> {
             TextField(
               controller: _oldPw,
               obscureText: true,
+              autocorrect: false,
+              enableSuggestions: false,
+              enableIMEPersonalizedLearning: false,
               enabled: !_busy,
               decoration: const InputDecoration(
                 labelText: 'Current master password',
@@ -110,6 +113,9 @@ class _ChangePasswordScreenState extends ConsumerState<ChangePasswordScreen> {
             TextField(
               controller: _newPw1,
               obscureText: true,
+              autocorrect: false,
+              enableSuggestions: false,
+              enableIMEPersonalizedLearning: false,
               enabled: !_busy,
               decoration: const InputDecoration(
                 labelText: 'New master password',
@@ -120,6 +126,9 @@ class _ChangePasswordScreenState extends ConsumerState<ChangePasswordScreen> {
             TextField(
               controller: _newPw2,
               obscureText: true,
+              autocorrect: false,
+              enableSuggestions: false,
+              enableIMEPersonalizedLearning: false,
               enabled: !_busy,
               decoration: const InputDecoration(
                 labelText: 'Confirm new master password',

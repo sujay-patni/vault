@@ -7,6 +7,8 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../../auth/session_manager.dart';
+import '../../security/cache_janitor.dart';
+import '../../security/password_generator.dart';
 import '../../vault/vault_attachment.dart';
 import '../../vault/vault_entry.dart';
 import '../../vault/vault_repository.dart';
@@ -141,8 +143,7 @@ class _EntryFormScreenState extends ConsumerState<EntryFormScreen> {
   }
 
   Future<void> _pickFileAttachments() async {
-    final cur = ref.read(vaultStatusProvider);
-    if (cur is! VaultUnlocked) return;
+    if (ref.read(vaultStatusProvider) is! VaultUnlocked) return;
     final result = await ref
         .read(sessionManagerProvider)
         .runExternalPicker(
@@ -154,7 +155,12 @@ class _EntryFormScreenState extends ConsumerState<EntryFormScreen> {
             withData: true,
           ),
         );
+    // The picker caches plaintext copies of picked files; bytes are already
+    // in memory, so remove the copies before doing anything else.
+    await sweepSensitiveCaches();
     if (!mounted || result == null) return;
+    final cur = ref.read(vaultStatusProvider);
+    if (cur is! VaultUnlocked) return;
 
     var nextVaultBytes =
         _otherVaultAttachmentBytes(cur) +
@@ -206,8 +212,7 @@ class _EntryFormScreenState extends ConsumerState<EntryFormScreen> {
   }
 
   Future<void> _capturePhotoAttachment() async {
-    final cur = ref.read(vaultStatusProvider);
-    if (cur is! VaultUnlocked) return;
+    if (ref.read(vaultStatusProvider) is! VaultUnlocked) return;
     setState(() => _attachmentBusy = true);
     try {
       final photo = await ref
@@ -215,13 +220,25 @@ class _EntryFormScreenState extends ConsumerState<EntryFormScreen> {
           .runExternalPicker(
             () => ImagePicker().pickImage(
               source: ImageSource.camera,
+              maxWidth: 1280,
+              maxHeight: 1280,
+              imageQuality: 72,
               requestFullMetadata: false,
             ),
           );
-      if (!mounted || photo == null) return;
+      if (photo == null) {
+        await sweepSensitiveCaches();
+        return;
+      }
 
       final bytes = await photo.readAsBytes();
+      // The capture (and any scaled variant) lives unencrypted in the app
+      // cache until removed.
+      await deleteQuietly(photo.path);
+      await sweepSensitiveCaches();
       if (!mounted) return;
+      final cur = ref.read(vaultStatusProvider);
+      if (cur is! VaultUnlocked) return;
       if (bytes.length > maxAttachmentBytes) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -398,11 +415,24 @@ class _EntryFormScreenState extends ConsumerState<EntryFormScreen> {
                 field.label,
                 _fieldControllers[field.key]!,
                 obscure: field.sensitive && !field.multiline,
+                sensitive: field.sensitive,
                 maxLines: field.multiline ? 5 : 1,
+                suffix: field.key == 'password'
+                    ? IconButton(
+                        tooltip: 'Generate password',
+                        icon: const Icon(Icons.casino_outlined),
+                        onPressed: _busy
+                            ? null
+                            : () => _openPasswordGenerator(
+                                _fieldControllers[field.key]!,
+                              ),
+                      )
+                    : null,
               ),
             _input(
               _itemType == VaultItemType.secureNote ? 'Note' : 'Notes',
               _notes,
+              sensitive: _itemType == VaultItemType.secureNote,
               maxLines: 6,
             ),
             _input(
@@ -442,28 +472,52 @@ class _EntryFormScreenState extends ConsumerState<EntryFormScreen> {
     );
   }
 
+  Future<void> _openPasswordGenerator(TextEditingController controller) async {
+    final generated = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (_) => const PasswordGeneratorSheet(),
+    );
+    if (!mounted || generated == null) return;
+    ref.read(sessionManagerProvider).bumpActivity();
+    controller.text = generated;
+  }
+
   Widget _input(
     String label,
     TextEditingController controller, {
     bool obscure = false,
+    bool sensitive = false,
     int maxLines = 1,
     bool autofocus = false,
     String? helperText,
     ValueChanged<String>? onChanged,
+    Widget? suffix,
   }) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: TextField(
         controller: controller,
         obscureText: obscure,
+        // Keep the IME from learning or suggesting secrets.
+        autocorrect: !sensitive,
+        enableSuggestions: !sensitive,
+        enableIMEPersonalizedLearning: !sensitive,
         autofocus: autofocus,
         enabled: !_busy,
         maxLines: obscure ? 1 : maxLines,
-        onChanged: onChanged,
+        onChanged: (value) {
+          // Soft-keyboard input produces no pointer events, so typing must
+          // also extend the idle-lock window.
+          ref.read(sessionManagerProvider).bumpActivity();
+          onChanged?.call(value);
+        },
         decoration: InputDecoration(
           labelText: label,
           helperText: helperText,
           border: const OutlineInputBorder(),
+          suffixIcon: suffix,
         ),
       ),
     );
@@ -800,4 +854,143 @@ String _photoFileName() {
   String two(int v) => v.toString().padLeft(2, '0');
   return 'photo-${now.year}${two(now.month)}${two(now.day)}-'
       '${two(now.hour)}${two(now.minute)}${two(now.second)}.jpg';
+}
+
+class PasswordGeneratorSheet extends StatefulWidget {
+  const PasswordGeneratorSheet({super.key});
+
+  @override
+  State<PasswordGeneratorSheet> createState() => _PasswordGeneratorSheetState();
+}
+
+class _PasswordGeneratorSheetState extends State<PasswordGeneratorSheet> {
+  PasswordGeneratorOptions _options = const PasswordGeneratorOptions();
+  late String _password;
+
+  @override
+  void initState() {
+    super.initState();
+    _password = generatePassword(_options);
+  }
+
+  void _update(PasswordGeneratorOptions next) {
+    // Never allow zero enabled sets.
+    if (next.enabledSets.isEmpty) return;
+    setState(() {
+      _options = next;
+      _password = generatePassword(next);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return SafeArea(
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(
+          VaultSpacing.lg,
+          VaultSpacing.sm,
+          VaultSpacing.lg,
+          VaultSpacing.lg + MediaQuery.of(context).viewInsets.bottom,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('Generate password', style: theme.textTheme.titleMedium),
+            const SizedBox(height: VaultSpacing.md),
+            Container(
+              padding: const EdgeInsets.symmetric(
+                horizontal: VaultSpacing.md,
+                vertical: VaultSpacing.sm,
+              ),
+              decoration: BoxDecoration(
+                color: VaultColors.surfaceHigh,
+                borderRadius: BorderRadius.circular(VaultRadii.md),
+                border: Border.all(color: VaultColors.border),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      _password,
+                      style: theme.textTheme.bodyLarge?.copyWith(
+                        fontFamily: 'monospace',
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Regenerate',
+                    icon: const Icon(Icons.refresh),
+                    onPressed: () => _update(_options),
+                  ),
+                ],
+              ),
+            ),
+            Row(
+              children: [
+                Expanded(
+                  child: Slider(
+                    value: _options.length.toDouble(),
+                    min: minGeneratedLength.toDouble(),
+                    max: maxGeneratedLength.toDouble(),
+                    divisions: maxGeneratedLength - minGeneratedLength,
+                    onChanged: (v) =>
+                        _update(_options.copyWith(length: v.round())),
+                  ),
+                ),
+                SizedBox(
+                  width: 64,
+                  child: Text(
+                    '${_options.length} chars',
+                    style: theme.textTheme.labelMedium,
+                    textAlign: TextAlign.end,
+                  ),
+                ),
+              ],
+            ),
+            _charsetToggle(
+              'Uppercase (A-Z)',
+              _options.upper,
+              (v) => _update(_options.copyWith(upper: v)),
+            ),
+            _charsetToggle(
+              'Lowercase (a-z)',
+              _options.lower,
+              (v) => _update(_options.copyWith(lower: v)),
+            ),
+            _charsetToggle(
+              'Digits (0-9)',
+              _options.digits,
+              (v) => _update(_options.copyWith(digits: v)),
+            ),
+            _charsetToggle(
+              'Symbols (!@#...)',
+              _options.symbols,
+              (v) => _update(_options.copyWith(symbols: v)),
+            ),
+            const SizedBox(height: VaultSpacing.md),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(_password),
+              child: const Text('Use password'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _charsetToggle(
+    String label,
+    bool value,
+    ValueChanged<bool> onChanged,
+  ) {
+    return SwitchListTile(
+      contentPadding: EdgeInsets.zero,
+      dense: true,
+      title: Text(label),
+      value: value,
+      onChanged: onChanged,
+    );
+  }
 }
