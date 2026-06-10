@@ -5,14 +5,12 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:pwm/crypto/argon2.dart';
 import 'package:pwm/vault/vault_file.dart';
 
-VaultBlob _sampleBlob({Uint8List? payload}) {
+VaultBlob _sampleBlob({Uint8List? payload, Argon2idParams? argonParams}) {
   return VaultBlob(
     salt: Uint8List.fromList(List<int>.generate(16, (i) => i)),
-    argonParams: const Argon2idParams(
-      memoryKib: 65536,
-      iterations: 3,
-      parallelism: 4,
-    ),
+    argonParams:
+        argonParams ??
+        const Argon2idParams(memoryKib: 65536, iterations: 3, parallelism: 4),
     wrapIv: Uint8List.fromList(List<int>.generate(12, (i) => 0x10 + i)),
     wrappedVaultKey: Uint8List.fromList(
       List<int>.generate(48, (i) => 0x20 + i),
@@ -85,6 +83,53 @@ void main() {
       final bytes = blob.toBytes();
       final parsed = VaultBlob.fromBytes(bytes);
       expect(parsed.payload.length, 0);
+    });
+
+    test('rejects unreasonable Argon2 parameters from untrusted bytes', () {
+      const bad = [
+        Argon2idParams(memoryKib: 63, iterations: 3, parallelism: 4),
+        Argon2idParams(
+          memoryKib: 3 * 1024 * 1024,
+          iterations: 3,
+          parallelism: 4,
+        ),
+        Argon2idParams(memoryKib: 65536, iterations: 0, parallelism: 4),
+        Argon2idParams(memoryKib: 65536, iterations: 101, parallelism: 4),
+        Argon2idParams(memoryKib: 65536, iterations: 3, parallelism: 0),
+        Argon2idParams(memoryKib: 65536, iterations: 3, parallelism: 17),
+      ];
+      for (final params in bad) {
+        final bytes = _sampleBlob(argonParams: params).toBytes();
+        expect(
+          () => VaultBlob.fromBytes(bytes),
+          throwsFormatException,
+          reason:
+              'mem=${params.memoryKib} iters=${params.iterations} '
+              'par=${params.parallelism} should be rejected',
+        );
+      }
+    });
+
+    test('accepts boundary Argon2 parameters', () {
+      const ok = [
+        Argon2idParams(
+          memoryKib: VaultBlob.minArgonMemoryKib,
+          iterations: 1,
+          parallelism: 1,
+        ),
+        Argon2idParams(
+          memoryKib: VaultBlob.maxArgonMemoryKib,
+          iterations: VaultBlob.maxArgonIterations,
+          parallelism: VaultBlob.maxArgonParallelism,
+        ),
+      ];
+      for (final params in ok) {
+        final bytes = _sampleBlob(argonParams: params).toBytes();
+        final parsed = VaultBlob.fromBytes(bytes);
+        expect(parsed.argonParams.memoryKib, params.memoryKib);
+        expect(parsed.argonParams.iterations, params.iterations);
+        expect(parsed.argonParams.parallelism, params.parallelism);
+      }
     });
   });
 

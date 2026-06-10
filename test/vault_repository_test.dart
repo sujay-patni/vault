@@ -169,6 +169,58 @@ void main() {
     );
   });
 
+  test('unlockWithVaultKey opens the vault without the password', () async {
+    final pw = passwordToUtf8Bytes('pw');
+    var u = await repo.create(masterPasswordUtf8: pw, params: _fastParams);
+    u = await repo.saveEntries(current: u, entries: [_entry(title: 'bio')]);
+
+    final repo2 = VaultRepository(vaultFile: File('${tmp.path}/vault.bin'));
+    final reopened = await repo2.unlockWithVaultKey(
+      vaultKey: Uint8List.fromList(u.vaultKey),
+    );
+    expect(reopened.entries.single.title, 'bio');
+  });
+
+  test('vault key stays valid across a master password change', () async {
+    final oldPw = passwordToUtf8Bytes('old-pw');
+    final newPw = passwordToUtf8Bytes('new-pw');
+    var u = await repo.create(masterPasswordUtf8: oldPw, params: _fastParams);
+    u = await repo.saveEntries(current: u, entries: [_entry()]);
+    final originalKey = Uint8List.fromList(u.vaultKey);
+
+    await repo.changePassword(
+      current: u,
+      newMasterPasswordUtf8: newPw,
+      params: _fastParams,
+    );
+
+    // Biometric storage holds the vault key, not the password — it must
+    // keep unlocking the rotated file.
+    final repo2 = VaultRepository(vaultFile: File('${tmp.path}/vault.bin'));
+    final reopened = await repo2.unlockWithVaultKey(vaultKey: originalKey);
+    expect(reopened.entries.length, 1);
+  });
+
+  test('vault key from before a foreign backup import is rejected', () async {
+    final pw = passwordToUtf8Bytes('pw');
+    final u = await repo.create(masterPasswordUtf8: pw, params: _fastParams);
+    final originalKey = Uint8List.fromList(u.vaultKey);
+
+    // A separately-created vault has a different vault_key.
+    final otherFile = File('${tmp.path}/other.bin');
+    final otherRepo = VaultRepository(vaultFile: otherFile);
+    await otherRepo.create(masterPasswordUtf8: pw, params: _fastParams);
+    final foreignBytes = await otherRepo.readRawBytes();
+
+    await repo.importBackup(masterPasswordUtf8: pw, bytes: foreignBytes);
+
+    final repo2 = VaultRepository(vaultFile: File('${tmp.path}/vault.bin'));
+    expect(
+      () => repo2.unlockWithVaultKey(vaultKey: originalKey),
+      throwsA(isA<Object>()),
+    );
+  });
+
   test('wrong password on unlock throws', () async {
     final pw = passwordToUtf8Bytes('right');
     await repo.create(masterPasswordUtf8: pw, params: _fastParams);

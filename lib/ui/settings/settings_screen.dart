@@ -3,6 +3,8 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../backup/backup_errors.dart';
 import '../../backup/backup_io.dart';
+import '../../auth/biometric_store.dart';
+import '../../auth/biometric_unlock.dart';
 import '../../auth/session_manager.dart';
 import '../../crypto/secure_bytes.dart';
 import '../../crypto/vault_crypto.dart';
@@ -22,6 +24,31 @@ class SettingsScreen extends ConsumerStatefulWidget {
 class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   bool _exporting = false;
   bool _importing = false;
+  bool _biometricBusy = false;
+
+  Future<void> _setBiometric(bool enable) async {
+    setState(() => _biometricBusy = true);
+    try {
+      final service = ref.read(biometricUnlockServiceProvider);
+      if (enable) {
+        final ok = await service.enable();
+        if (!ok && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Fingerprint setup cancelled.')),
+          );
+        }
+      } else {
+        await service.disable();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Fingerprint unlock turned off.')),
+          );
+        }
+      }
+    } finally {
+      if (mounted) setState(() => _biometricBusy = false);
+    }
+  }
 
   Future<void> _export() async {
     final confirmed = await showDialog<bool>(
@@ -116,6 +143,25 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           .read(vaultStatusProvider.notifier)
           .importBackup(masterPasswordUtf8: pwBytes, bytes: bytes);
       imported = true;
+      // The imported vault has its own vault_key, so any fingerprint-stored
+      // key is now stale — drop it rather than fail at next unlock.
+      final wasBiometric =
+          await ref.read(biometricEnabledProvider.future).catchError((_) {
+        return false;
+      });
+      if (wasBiometric) {
+        await ref.read(biometricUnlockServiceProvider).disable();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Fingerprint unlock was turned off because the vault was '
+                'replaced — re-enable it in Settings.',
+              ),
+            ),
+          );
+        }
+      }
     } on FormatException catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(
@@ -231,6 +277,31 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 MaterialPageRoute(builder: (_) => const ChangePasswordScreen()),
               ),
             ),
+            if (ref.watch(biometricSupportProvider).value ==
+                BiometricSupport.available)
+              _SettingsTile(
+                leading: const Icon(Icons.fingerprint),
+                title: const Text('Unlock with fingerprint'),
+                subtitle: const Text(
+                  'Use your fingerprint instead of the master password.',
+                ),
+                trailing: _biometricBusy
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Switch(
+                        value:
+                            ref.watch(biometricEnabledProvider).value ?? false,
+                        onChanged: _setBiometric,
+                      ),
+                onTap: _biometricBusy
+                    ? null
+                    : () => _setBiometric(
+                        !(ref.read(biometricEnabledProvider).value ?? false),
+                      ),
+              ),
             _SettingsTile(
               leading: const Icon(Icons.lock_outline),
               title: const Text('Lock now'),
@@ -269,6 +340,9 @@ class _BackupPasswordDialogState extends State<_BackupPasswordDialog> {
       content: TextField(
         controller: _ctrl,
         obscureText: true,
+        autocorrect: false,
+        enableSuggestions: false,
+        enableIMEPersonalizedLearning: false,
         autofocus: true,
         decoration: const InputDecoration(
           labelText: 'Master password for the backup',

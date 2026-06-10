@@ -90,6 +90,24 @@ class VaultRepository {
     return _unlockFromBlob(masterPasswordUtf8: masterPasswordUtf8, blob: blob);
   }
 
+  /// Unlock using the raw vault_key (biometric path) — no Argon2id involved.
+  /// On success the returned [VaultUnlocked] takes ownership of [vaultKey]
+  /// (it is zeroed on lock). On failure the caller must zero it.
+  Future<VaultUnlocked> unlockWithVaultKey({
+    required Uint8List vaultKey,
+  }) async {
+    final bytes = await _file.readAsBytes();
+    final blob = VaultBlob.fromBytes(Uint8List.fromList(bytes));
+    final entriesJson = await _crypto.unlockWithVaultKey(
+      vaultKey: vaultKey,
+      blob: blob,
+    );
+    _blob = blob;
+    final entries = _decodeEntries(entriesJson);
+    entriesJson.secureZero();
+    return VaultUnlocked(vaultKey: vaultKey, entries: entries);
+  }
+
   Future<VaultUnlocked> _unlockFromBlob({
     required Uint8List masterPasswordUtf8,
     required VaultBlob blob,
@@ -188,9 +206,9 @@ class VaultStatusNotifier extends StateNotifier<VaultStatus> {
   final VaultRepository _repo;
 
   Future<void> _bootstrap() async {
-    state = (await _repo.exists())
-        ? const VaultLocked()
-        : const VaultUninitialized();
+    final exists = await _repo.exists();
+    if (!mounted) return;
+    state = exists ? const VaultLocked() : const VaultUninitialized();
   }
 
   Future<void> setupAndUnlock({required Uint8List masterPasswordUtf8}) async {
@@ -199,6 +217,13 @@ class VaultStatusNotifier extends StateNotifier<VaultStatus> {
 
   Future<void> unlock({required Uint8List masterPasswordUtf8}) async {
     state = await _repo.unlock(masterPasswordUtf8: masterPasswordUtf8);
+  }
+
+  /// Biometric path: unlock with the raw vault_key retrieved from
+  /// hardware-backed storage. On success the state takes ownership of
+  /// [vaultKey]; on throw the caller must zero it.
+  Future<void> unlockWithVaultKey({required Uint8List vaultKey}) async {
+    state = await _repo.unlockWithVaultKey(vaultKey: vaultKey);
   }
 
   Future<void> saveEntries(List<VaultEntry> entries) async {

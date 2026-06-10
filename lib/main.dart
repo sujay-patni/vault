@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import 'auth/session_manager.dart';
+import 'security/cache_janitor.dart';
 import 'ui/list/vault_list_screen.dart';
 import 'ui/shared/app_theme.dart';
 import 'ui/setup/setup_screen.dart';
@@ -40,6 +41,13 @@ class _Root extends ConsumerWidget {
       data: (_) {
         // Eagerly start the session manager once the repo is ready.
         ref.watch(sessionManagerProvider);
+        // Every lock path funnels through this transition; remove any
+        // plaintext picker/share residue left in the cache directory.
+        ref.listen<VaultStatus>(vaultStatusProvider, (previous, next) {
+          if (previous is VaultUnlocked && next is! VaultUnlocked) {
+            sweepSensitiveCaches();
+          }
+        });
         final status = ref.watch(vaultStatusProvider);
         return IdleActivityDetector(
           child: switch (status) {
